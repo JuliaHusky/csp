@@ -1309,20 +1309,12 @@ void KeyboardInput(void *argument)
 void ServoTask(void *argument)
 {
   /* USER CODE BEGIN ServoTask */
-  AccessState_t lastState = (AccessState_t)99;
   /* Infinite loop */
   for(;;)
   {
       AccessState_t stateUpdate;
-      if (osMessageQueueGet(ServoStateQHandle, &stateUpdate, NULL, 50) != osOK)
+      if (osMessageQueueGet(ServoStateQHandle, &stateUpdate, NULL, osWaitForever) == osOK)
       {
-          stateUpdate = accessState; // fallback to preserve behaviour if queue misses an update
-      }
-
-      if (stateUpdate != lastState)
-      {
-          lastState = stateUpdate;
-
           if (stateUpdate == STATE_LOCKED)
           {
               // locked position
