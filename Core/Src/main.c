@@ -58,6 +58,19 @@ typedef enum
     UART_MODE_ADD_PIN
 } UartMode_t;
 
+typedef enum
+{
+    KEYPAD_EVT_DIGIT,
+    KEYPAD_EVT_CLEAR,
+    KEYPAD_EVT_SUBMIT
+} KeypadEventType_t;
+
+typedef struct
+{
+    KeypadEventType_t type;
+    char key;
+} KeypadEvent_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -112,6 +125,21 @@ const osThreadAttr_t LCDtask_attributes = {
   .priority = (osPriority_t) osPriorityHigh,
   .stack_size = 128 * 4
 };
+/* Definitions for KeypadEventsQ */
+osMessageQueueId_t KeypadEventsQHandle;
+const osMessageQueueAttr_t KeypadEventsQ_attributes = {
+  .name = "KeypadEventsQ"
+};
+/* Definitions for ServoStateQ */
+osMessageQueueId_t ServoStateQHandle;
+const osMessageQueueAttr_t ServoStateQ_attributes = {
+  .name = "ServoStateQ"
+};
+/* Definitions for LcdStateQ */
+osMessageQueueId_t LcdStateQHandle;
+const osMessageQueueAttr_t LcdStateQ_attributes = {
+  .name = "LcdStateQ"
+};
 /* USER CODE BEGIN PV */
 volatile AccessState_t accessState = STATE_LOCKED;
 uint8_t tx_buffer[27]="Welcome to BinaryUpdates!\n\r";
@@ -119,9 +147,6 @@ uint8_t rx_idx;
 uint8_t rx_data[1];
 uint8_t rx_buffer[100];
 uint8_t transfer_cplt;
-
-volatile uint8_t pin_ready = 0;
-char pin_entered[PIN_LENGTH + 1] = {0};
 
 volatile uint8_t enteringPin = 0;
 volatile uint8_t failedAttempts = 0;
@@ -159,11 +184,40 @@ static UserAccount_t userDb[MAX_USERS];
 static int Db_AddUser(const char *name, const char *pin);
 static void UART_ShowUsers(void);
 /* USER CODE BEGIN PFP */
+static void PublishAccessState(AccessState_t state);
+static void SetAccessState(AccessState_t state);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void PublishAccessState(AccessState_t state)
+{
+  accessState = state;
+
+  if (ServoStateQHandle != NULL) {
+    if (osMessageQueuePut(ServoStateQHandle, &state, 0, 0) != osOK) {
+      AccessState_t stale;
+      (void)osMessageQueueGet(ServoStateQHandle, &stale, NULL, 0);
+      (void)osMessageQueuePut(ServoStateQHandle, &state, 0, 0);
+    }
+  }
+
+  if (LcdStateQHandle != NULL) {
+    if (osMessageQueuePut(LcdStateQHandle, &state, 0, 0) != osOK) {
+      AccessState_t stale;
+      (void)osMessageQueueGet(LcdStateQHandle, &stale, NULL, 0);
+      (void)osMessageQueuePut(LcdStateQHandle, &state, 0, 0);
+    }
+  }
+}
+
+static void SetAccessState(AccessState_t state)
+{
+  if (accessState != state) {
+    PublishAccessState(state);
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -238,6 +292,9 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  KeypadEventsQHandle = osMessageQueueNew(8, sizeof(KeypadEvent_t), &KeypadEventsQ_attributes);
+  ServoStateQHandle = osMessageQueueNew(1, sizeof(AccessState_t), &ServoStateQ_attributes);
+  LcdStateQHandle = osMessageQueueNew(4, sizeof(AccessState_t), &LcdStateQ_attributes);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -796,7 +853,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 void AccessControlTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-    accessState = STATE_LOCKED;
+    PublishAccessState(STATE_LOCKED);
 
     lcd_init();
     lcd_clear();
@@ -810,6 +867,8 @@ void AccessControlTask(void *argument)
     PrintMenu();
 
     uint32_t lastRemaining = 999;
+    char pin[PIN_LENGTH + 1] = {0};
+    uint8_t pinIdx = 0;
 
     for (;;)
     {
@@ -865,18 +924,54 @@ void AccessControlTask(void *argument)
             }
         }
 
-        // Handle submitted keypad PIN
-        if (pin_ready)
+        KeypadEvent_t keypadEvent;
+        while (osMessageQueueGet(KeypadEventsQHandle, &keypadEvent, NULL, 0) == osOK)
         {
-            pin_ready = 0;
+            if (keypadEvent.type == KEYPAD_EVT_DIGIT)
+            {
+                if (!enteringPin)
+                {
+                    enteringPin = 1;
+                    pinIdx = 0;
+                    memset(pin, 0, sizeof(pin));
+                }
+
+                if (pinIdx < PIN_LENGTH)
+                {
+                    pin[pinIdx++] = keypadEvent.key;
+                    pin[pinIdx] = '\0';
+                    LCD_ShowMaskedPin(pinIdx);
+                }
+                continue;
+            }
+
+            if (keypadEvent.type == KEYPAD_EVT_CLEAR)
+            {
+                pinIdx = 0;
+                memset(pin, 0, sizeof(pin));
+                enteringPin = 1;
+                LCD_ShowMaskedPin(0);
+                continue;
+            }
+
+            if (keypadEvent.type != KEYPAD_EVT_SUBMIT || pinIdx != PIN_LENGTH)
+            {
+                pinIdx = 0;
+                memset(pin, 0, sizeof(pin));
+                enteringPin = 0;
+                continue;
+            }
+
             enteringPin = 0;
 
-            int userIdx = Db_FindByPin(pin_entered);
+            int userIdx = Db_FindByPin(pin);
+            pinIdx = 0;
+            memset(pin, 0, sizeof(pin));
 
             if (userIdx >= 0)
             {
                 failedAttempts = 0;
-                accessState = STATE_UNLOCKED;
+                SetAccessState(STATE_UNLOCKED);
 
                 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);     // Green ON
                 HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);   // Red OFF
@@ -897,7 +992,7 @@ void AccessControlTask(void *argument)
             }
             else
             {
-                accessState = STATE_LOCKED;
+                SetAccessState(STATE_LOCKED);
                 failedAttempts++;
 
                 HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);     // Red ON
@@ -954,7 +1049,7 @@ void AccessControlTask(void *argument)
             {
                 if (strcmp((char*)rx_buffer, "1") == 0)
                 {
-                    accessState = STATE_UNLOCKED;
+                    SetAccessState(STATE_UNLOCKED);
 
                     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_SET);
                     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
@@ -971,7 +1066,7 @@ void AccessControlTask(void *argument)
                 }
                 else if (strcmp((char*)rx_buffer, "2") == 0)
                 {
-                    accessState = STATE_LOCKED;
+                    SetAccessState(STATE_LOCKED);
 
                     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
                     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
@@ -1162,9 +1257,6 @@ void ButtonTask(void *argument)
 /* USER CODE END Header_KeyboardInput */
 void KeyboardInput(void *argument)
 {
-    char pin[PIN_LENGTH + 1] = {0};
-    uint8_t idx = 0;
-
     for (;;)
     {
         if (lockoutActive)
@@ -1179,38 +1271,18 @@ void KeyboardInput(void *argument)
         {
             if (key >= '0' && key <= '9')
             {
-                if (!enteringPin)
-                {
-                    enteringPin = 1;
-                    idx = 0;
-                    memset(pin, 0, sizeof(pin));
-                }
-
-                if (idx < PIN_LENGTH)
-                {
-                    pin[idx++] = key;
-                    pin[idx] = '\0';
-                    LCD_ShowMaskedPin(idx);
-                }
+                KeypadEvent_t evt = {KEYPAD_EVT_DIGIT, key};
+                (void)osMessageQueuePut(KeypadEventsQHandle, &evt, 0, 0);
             }
             else if (key == '*')
             {
-                idx = 0;
-                memset(pin, 0, sizeof(pin));
-                enteringPin = 1;
-                LCD_ShowMaskedPin(0);
+                KeypadEvent_t evt = {KEYPAD_EVT_CLEAR, key};
+                (void)osMessageQueuePut(KeypadEventsQHandle, &evt, 0, 0);
             }
             else if (key == '#')
             {
-                if (idx == PIN_LENGTH)
-                {
-                    strcpy(pin_entered, pin);
-                    pin_ready = 1;
-                }
-
-                idx = 0;
-                memset(pin, 0, sizeof(pin));
-                enteringPin = 0;
+                KeypadEvent_t evt = {KEYPAD_EVT_SUBMIT, key};
+                (void)osMessageQueuePut(KeypadEventsQHandle, &evt, 0, 0);
             }
 
             while (scan_keypad() != 99)
@@ -1237,15 +1309,13 @@ void KeyboardInput(void *argument)
 void ServoTask(void *argument)
 {
   /* USER CODE BEGIN ServoTask */
-	AccessState_t lastState = (AccessState_t)99;
   /* Infinite loop */
   for(;;)
   {
-      if (accessState != lastState)
+      AccessState_t stateUpdate;
+      if (osMessageQueueGet(ServoStateQHandle, &stateUpdate, NULL, osWaitForever) == osOK)
       {
-          lastState = accessState;
-
-          if (accessState == STATE_LOCKED)
+          if (stateUpdate == STATE_LOCKED)
           {
               // locked position
               __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 1000);
@@ -1254,7 +1324,7 @@ void ServoTask(void *argument)
                                 strlen("Servo -> LOCKED\r\n"),
                                 HAL_MAX_DELAY);
           }
-          else if (accessState == STATE_UNLOCKED)
+          else if (stateUpdate == STATE_UNLOCKED)
           {
               // unlocked position
               __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 500);
@@ -1264,8 +1334,6 @@ void ServoTask(void *argument)
                                 HAL_MAX_DELAY);
           }
       }
-
-      osDelay(50);
   }
 }
 
@@ -1283,16 +1351,23 @@ void ServoTask(void *argument)
 /* USER CODE END Header_lcdTask */
 void lcdTask(void *argument)
 {
-    AccessState_t lastState = (AccessState_t)99;
+    AccessState_t lastState = accessState;
+    AccessState_t shownState = (AccessState_t)99;
 
     for(;;)
     {
+        AccessState_t stateUpdate;
+        while (osMessageQueueGet(LcdStateQHandle, &stateUpdate, NULL, 0) == osOK)
+        {
+            lastState = stateUpdate;
+        }
+
         if (!enteringPin && !lockoutActive)
         {
-            if (accessState != lastState)
+            if (lastState != shownState)
             {
-                lastState = accessState;
-                LCD_ShowState(accessState);
+                LCD_ShowState(lastState);
+                shownState = lastState;
             }
         }
 
